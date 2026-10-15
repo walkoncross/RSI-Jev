@@ -388,6 +388,14 @@ def serve_mlx(a: argparse.Namespace, ref) -> int:
     if effort is not None and explicit_mode:
         raise SystemExit("--effort / RSIJEV_EFFORT sets the default depth itself; drop "
                          "--adaptive / --fixed-exit (and RSIJEV_ADAPTIVE / RSIJEV_FIXED_EXIT)")
+    # MLX binds what the loader built to the loading thread's streams: a path this thread
+    # has never run fails on the worker thread with "There is no Stream(cpu, 1) in current
+    # thread." (measured: the worker is fine once this thread has run the path, and the
+    # shapes a request can take do not matter, only the paths -- short state, long state,
+    # image). So run warm_up here first, on the loading thread; the one below then re-runs
+    # the same paths through the worker, which is what makes the worker work at all.
+    from rsijev.mlx.serving import make_scorer as mlx_scorer
+    warm_up(mlx_scorer(s), images=s.prep is not None)
     scorer = mlx_worker(s, batch_size=a.batch_size, default_effort=effort)
     if not a.no_warmup:
         print(f"warm-up: {warm_up(scorer, images=s.prep is not None):.1f} s", flush=True)
