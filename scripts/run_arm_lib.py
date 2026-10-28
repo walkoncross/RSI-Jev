@@ -520,7 +520,10 @@ def run_arm(*, lm, tok, targets, corpus, device, spec, name, items_path=None):
               f"({'OK' if init_diff <= RESIDUAL_TOL else 'INVALID'})", flush=True)
 
     probe = None
-    if not cfg["freeze_base"]:
+    # steps=0 is a load check (fit.py:1007-1011): no optimizer step runs, so the
+    # tower cannot move and probing it would always report "gradients never
+    # reached it". Only probe when there is actually training to verify.
+    if not cfg["freeze_base"] and cfg["steps"] > 0:
         probe = {n: p_.detach().clone() for n, p_ in list(tower.named_parameters())
                  if p_.requires_grad}
         # The FIRST trainable tensors: every readout tap depends on them. The last
