@@ -44,7 +44,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rsijev.contract import gold_label, load_cases            # noqa: E402
+from rsijev.contract import Prediction, gold_label, load_cases  # noqa: E402
 from rsijev.evaluate import predict, score_predictions        # noqa: E402
 from serve.release import load_release, resolve_ckpt          # noqa: E402
 
@@ -169,6 +169,11 @@ def main() -> int:
                     help="override meta['base_model'] (a local HF directory)")
     ap.add_argument("--compare", default=None,
                     help="another run's rows JSONL; pairs on (case_id, key)")
+    ap.add_argument("--flush-every", type=int, default=512, metavar="N",
+                    help="写盘粒度（条）；每 N 条追加一次 rows JSONL 并打印进度。"
+                         "0 表示一次性跑完（旧行为）")
+    ap.add_argument("--resume", action="store_true",
+                    help="复用 rows JSONL 里已完成的行，只跑缺的（中途被杀后直接重跑同一条命令）")
     args = ap.parse_args()
 
     ckpt = Path(args.ckpt).expanduser().resolve()
@@ -205,41 +210,97 @@ def main() -> int:
     summary = {"ckpt": str(ckpt), "val": args.val, "n": len(cases),
                "dtype": args.dtype, "orders": orders, "per_order": {}}
 
+    # 断点续跑：把上次已经落盘的 row 读回来，(case_id, order) 是去重键。
+    # 行文件是流式追加的，所以中途被杀也只丢最后一块。
+    resumed: dict[tuple[str, str], dict] = {}
+    if args.resume and rows_out.is_file():
+        for line in rows_out.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                resumed[(r["case_id"], r["order"])] = r
+        print(f"[resume] {len(resumed)} rows from {rows_out}", flush=True)
+    rows_out.parent.mkdir(parents=True, exist_ok=True)
+    # 不续跑就截断，避免把上一次的结果追加进来；续跑则继续追加
+    if not args.resume:
+        rows_out.write_text("", encoding="utf-8")
+
+    chunk = args.flush_every or max(len(cases), 1)
+    by_id = {c.case_id: c for c in cases}
     for order in orders:
         e = dataclasses.replace(enc, option_order=order)
-        # The tower precision is already set by load_release(infer_dtype=...);
-        # passing eval_dtype here would try to cast the fp32 scorer too.
-        preds = predict(model, tok, cases, e, max_options=int(spec["max_options"]),
-                        device=device, batch_size=batch_size, eval_dtype=None)
-        rep = score_predictions(preds, target="manual_seat_v02", split="val")
-        for mode, mr in rep.per_mode.items():
-            summary["per_order"].setdefault(order, {})[mode] = {
-                "n": mr.n, "accuracy": round(mr.accuracy, 4),
-                "base_rate": round(mr.base_rate, 4), "ece": round(mr.ece, 4)}
-        correct = 0
         per_day: dict[str, list[int]] = defaultdict(list)
         recall: dict[str, list[int]] = defaultdict(list)
-        for c, q, p in preds:
-            gold = gold_label(q, c.gold[q.key])
-            pred = q.options[max(range(len(p.probs)), key=p.probs.__getitem__)]
-            day, uid = split_id(c.case_id)
-            ok = int(pred == gold)
+        correct = total = 0
+
+        # 先把已完成的 row 计入统计，再只跑剩下的
+        done: set[str] = set()
+        all_preds: list = []
+        for (case_id, o), r in resumed.items():
+            if o != order:
+                continue
+            done.add(case_id)
+            day, uid = r["day"], r["uid"]
+            ok = int(r["correct"])
             correct += ok
+            total += 1
             per_day[day].append(ok)
-            recall[gold].append(ok)
-            rows[(c.case_id, q.key)] = {
-                "case_id": c.case_id, "key": q.key, "order": order, "day": day,
-                "uid": uid, "gold": gold, "pred": pred, "correct": ok,
-                "confidence": round(p.confidence(), 6)}
-        lo, hi = wilson(correct, len(preds))
-        summary["per_order"][order]["pooled"] = {
-            "n": len(preds), "accuracy": round(correct / len(preds), 4),
-            "ci95": [round(lo, 4), round(hi, 4)],
+            recall[r["gold"]].append(ok)
+            rows[(case_id, r["key"])] = r
+            # 用落盘的 probs 还原预测，好让 ECE 覆盖续跑前那部分
+            case = by_id.get(case_id)
+            if case is not None and r.get("probs"):
+                q = next((qq for qq in case.questions if qq.key == r["key"]), None)
+                if q is not None:
+                    all_preds.append((case, q, Prediction(tuple(r["probs"]))))
+        todo = [c for c in cases if c.case_id not in done]
+        if done:
+            print(f"[{order}] skipping {len(done)} done, {len(todo)} to go", flush=True)
+
+        with open(rows_out, "a", encoding="utf-8") as fh:
+            for start in range(0, len(todo), chunk):
+                part = todo[start:start + chunk]
+                # The tower precision is already set by load_release(infer_dtype=...);
+                # passing eval_dtype here would try to cast the fp32 scorer too.
+                preds = predict(model, tok, part, e, max_options=int(spec["max_options"]),
+                                device=device, batch_size=batch_size, eval_dtype=None)
+                all_preds.extend(preds)
+                for c, q, p in preds:
+                    gold = gold_label(q, c.gold[q.key])
+                    pred = q.options[max(range(len(p.probs)), key=p.probs.__getitem__)]
+                    day, uid = split_id(c.case_id)
+                    ok = int(pred == gold)
+                    correct += ok
+                    total += 1
+                    per_day[day].append(ok)
+                    recall[gold].append(ok)
+                    row = {"case_id": c.case_id, "key": q.key, "order": order, "day": day,
+                           "uid": uid, "gold": gold, "pred": pred, "correct": ok,
+                           "confidence": round(p.confidence(), 6),
+                           # 存下来才能让 --resume 之后重算 ECE（rows 是唯一产物）
+                           "probs": [round(x, 6) for x in p.probs]}
+                    rows[(c.case_id, q.key)] = row
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fh.flush()
+                print(f"[{order}] {total}/{len(cases)} running acc "
+                      f"{correct / total:.4f}", flush=True)
+
+        if all_preds:
+            rep = score_predictions(all_preds, target="manual_seat_v02", split="val")
+            for mode, mr in rep.per_mode.items():
+                summary["per_order"].setdefault(order, {})[mode] = {
+                    "n": mr.n, "accuracy": round(mr.accuracy, 4),
+                    "base_rate": round(mr.base_rate, 4), "ece": round(mr.ece, 4)}
+            del all_preds
+        wi, hi = wilson(correct, total)
+        # 全部靠 --resume 覆盖时上面不会跑 score_predictions，这里必须先建 key
+        summary["per_order"].setdefault(order, {})["pooled"] = {
+            "n": total, "accuracy": round(correct / total, 4) if total else 0.0,
+            "ci95": [round(wi, 4), round(hi, 4)],
             "per_day": {d: round(sum(v) / len(v), 4) for d, v in sorted(per_day.items())},
             "recall": {g: round(sum(v) / len(v), 4) for g, v in sorted(recall.items())},
         }
-        print(f"[{order}] acc {correct / len(preds):.4f} "
-              f"[{lo:.4f}, {hi:.4f}] n={len(preds)}", flush=True)
+        acc = correct / total if total else 0.0
+        print(f"[{order}] acc {acc:.4f} [{wi:.4f}, {hi:.4f}] n={total}", flush=True)
 
     cards = defaultdict(list)
     for r in rows.values():
@@ -248,11 +309,8 @@ def main() -> int:
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    rows_out.parent.mkdir(parents=True, exist_ok=True)
-    with open(rows_out, "w", encoding="utf-8") as fh:
-        for k in sorted(rows):
-            fh.write(json.dumps(rows[k], ensure_ascii=False) + "\n")
-    print(f"[done] {out}\n       rows {rows_out}", flush=True)
+    # rows_out 已经在每个 chunk 之后追加落盘了，这里不再重写（重写会重复一份）
+    print(f"[done] {out}\n       rows {rows_out} ({len(rows)} rows)", flush=True)
 
     if args.compare:
         other_raw = [json.loads(line) for line in
