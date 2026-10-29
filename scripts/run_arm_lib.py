@@ -531,6 +531,49 @@ def run_arm(*, lm, tok, targets, corpus, device, spec, name, items_path=None):
         # the final norm get zero gradient by construction, and probing them
         # raised a false alarm on a tower that had in fact trained.
         probe = dict(list(probe.items())[:4])
+    # Mid-run snapshots (fit_extra.save_every > 0): before this, a run killed at
+    # hour 5 had written nothing and the only copy was the in-memory model. The
+    # writer lives here rather than in fit() because the release layout and the
+    # spec do. Each snapshot is a full release directory (tower + scorer + meta),
+    # so it can be scored with eval_val.py --ckpt or served; it is NOT resumable
+    # (no optimizer state -- that copy would be ~67 GB).
+    snap_every = int((cfg["fit_extra"] or {}).get("save_every") or 0)
+    snap_keep = max(1, int((cfg["fit_extra"] or {}).get("save_keep") or 1))
+    on_snapshot = None
+    if snap_every and not cfg["save_dir"]:
+        print(f"    fit_extra.save_every={snap_every} but no save_dir: snapshots off", flush=True)
+    elif snap_every:
+        snap_root = Path(str(cfg["save_dir"]) + "-snapshots")
+        # fp32 bytes per snapshot = exactly what save_release writes
+        snap_bytes = 4 * (sum(v.numel() for v in model.tower.state_dict().values())
+                          + sum(v.numel() for v in model.scorer.state_dict().values()))
+
+        def on_snapshot(step, loss):
+            import shutil
+            probe = snap_root                       # the dir itself appears on first write
+            while not probe.exists():
+                probe = probe.parent
+            free = shutil.disk_usage(probe).free
+            if free < snap_bytes * 1.2:
+                print(f"    snapshot step {step} SKIPPED: {free / 2**30:.1f} GiB free < "
+                      f"{snap_bytes * 1.2 / 2**30:.1f} GiB needed", flush=True)
+                return
+            tmp = snap_root / f"step-{step:05d}.partial"
+            final = snap_root / f"step-{step:05d}"
+            save_release(model, lm, cfg, tmp, tapped=tapped,
+                         train_seconds=round(time.perf_counter() - t0),
+                         history=[{"step": step - 1, "loss": loss}],
+                         n_train_cases=len(train_cases))
+            tmp.rename(final)          # only a finished write gets the real name
+            done = sorted(p for p in snap_root.glob("step-*")
+                          if p.is_dir() and not p.name.endswith(".partial"))
+            for old in done[:-snap_keep]:
+                shutil.rmtree(old)
+                print(f"    snapshot rotated out {old.name}", flush=True)
+
+        print(f"    snapshots: every {snap_every} steps -> {snap_root} "
+              f"(keep {snap_keep}, ~{snap_bytes / 2**30:.1f} GiB each)", flush=True)
+
     t0 = time.perf_counter()
     hist = fit(model, tok, train_cases, enc,
                FitConfig(objective=cfg["objective"], steps=cfg["steps"],
@@ -543,7 +586,8 @@ def run_arm(*, lm, tok, targets, corpus, device, spec, name, items_path=None):
                          prior_kl=cfg["prior_kl"], rl=rl_cfg,
                          autocast_bf16=not cfg["freeze_base"],
                          **dict(cfg["fit_extra"] or {})),
-               max_options=cfg["max_options"], seed=cfg["seed"], device=device)
+               max_options=cfg["max_options"], seed=cfg["seed"], device=device,
+               on_snapshot=on_snapshot)
     train_s = time.perf_counter() - t0
     if probe is not None:
         moved = {n: float((dict(tower.named_parameters())[n].detach() - v).abs().max())

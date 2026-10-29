@@ -55,6 +55,15 @@ class FitConfig:
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     keep_last_k: int = 3             # checkpoints to average; free variance reduction
+    # ---- mid-run snapshots --------------------------------------------------
+    # Every N optimizer steps, hand the caller a loadable snapshot (0 = off).
+    # fit() owns the loop, so it is the only place this can happen; the WRITER
+    # is supplied by the caller as `on_snapshot(step, loss)` because the release
+    # layout and the spec live in run_arm_lib. A snapshot has the release
+    # layout, so a run that dies at hour 5 can still be evaluated or served
+    # (--ckpt); it is NOT resumable (no optimizer state).
+    save_every: int = 0
+    save_keep: int = 1               # snapshots the writer keeps before rotating
     prior_kl: float = 0.0            # weight on KL(base || model); 0 disables
     # bf16 autocast for the forward pass while the weights stay fp32. Needed when
     # the tower trains: fp32 activations for 24 layers at batch 16 used 79 GB.
@@ -572,8 +581,14 @@ def aux_exit_term(cfg: "FitConfig", main_logits, aux_logits, gold, option_mask, 
 
 
 def fit(model, tokenizer, cases: Sequence[Case], enc: EncodeConfig, cfg: FitConfig, *,
-        max_options: int, seed: int, device: str = "cuda", _helpers: dict | None = None) -> dict:
-    """Train in place. Returns the averaged scorer state plus a small history."""
+        max_options: int, seed: int, device: str = "cuda", _helpers: dict | None = None,
+        on_snapshot=None) -> dict:
+    """Train in place. Returns the averaged scorer state plus a small history.
+
+    `on_snapshot(step, loss)` is called every `cfg.save_every` steps (never on the
+    last step: the caller's final save covers that), starting after the step's
+    update. It is expected to copy the weights synchronously; fit() makes no
+    guarantee about the optimizer state at that moment being capturable."""
     g = seed_everything(seed)
     dev_type0 = "cuda" if str(device).startswith("cuda") else "cpu"
     if cfg.train_max_length:
@@ -996,6 +1011,11 @@ def fit(model, tokenizer, cases: Sequence[Case], enc: EncodeConfig, cfg: FitConf
                                                                     for p in aux_heads.parameters()))), 3)}
                                if aux_heads is not None else {}),
                             **({"nf_skips": nf["total"], "nf_aux_skips": nf["aux_total"]} if nf_max else {})})
+        if (on_snapshot is not None and cfg.save_every
+                and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps):
+            # Mid-run snapshot of a loadable release. Deliberately not on the last
+            # step: that one is the caller's final save, possibly recalibrated.
+            on_snapshot(step + 1, float(loss.detach()))
         if step >= cfg.steps - cfg.keep_last_k:
             ckpts.append({k: v.detach().cpu().clone()
                           for k, v in model.scorer.state_dict().items()})
